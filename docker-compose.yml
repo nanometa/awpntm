@@ -1,0 +1,34 @@
+services:
+
+  # ── Wallet 3 ────────────────────────────────────────────────────────────────
+  wallet-3:
+    build: .
+    restart: unless-stopped
+    container_name: predict-wallet-3
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - wallet3-data:/app/data
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      PREDICT_SERVER_URL:  ${PREDICT_SERVER_URL:-https://api.agentpredict.work}
+      INACTIVITY_TIMEOUT:  ${INACTIVITY_TIMEOUT:-600}
+      POLL_INTERVAL:       ${POLL_INTERVAL:-30}
+      INDEP_COOLDOWN:      ${INDEP_COOLDOWN:-120}
+      AWP_ADDRESS:         ${WALLET3_ADDRESS}
+      AWP_PRIVATE_KEY:     ${WALLET3_PRIVATE_KEY}
+      AWP_AGENT_ID:        wallet-3
+      # Local LLM config
+      LLM_BASE_URL:        ${LLM_BASE_URL:-http://host.docker.internal:18789/v1}
+      LLM_MODEL:           ${LLM_MODEL:-local-model}
+      NVIDIA_API_KEY:      ${NVIDIA_API_KEY:-}
+      # No Proxy (0 DH)
+      PROXY_HOST:          ""
+      PROXY_PORT:          ""
+      PROXY_USER:          ""
+      PROXY_PASS:          ""
+
+volumes:
+  wallet3-data:

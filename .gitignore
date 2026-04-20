@@ -1,0 +1,16 @@
+# Secret environment file — NEVER commit this
+.env
+*.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+*.json.bak
+
+# Docker volumes (local)
+docker-volumes/
+
+# OS
+.DS_Store
+Thumbs.db
