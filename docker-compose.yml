@@ -23,6 +23,7 @@ services:
       # Local LLM config
       LLM_BASE_URL:        ${LLM_BASE_URL:-http://host.docker.internal:18789/v1}
       LLM_MODEL:           ${LLM_MODEL:-local-model}
+      FIREWORKS_API_KEY:   ${FIREWORKS_API_KEY:-}
       NVIDIA_API_KEY:      ${NVIDIA_API_KEY:-}
       # No Proxy (0 DH)
       PROXY_HOST:          ""

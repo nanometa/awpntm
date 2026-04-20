@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 # ── Config ────────────────────────────────────────────────────────────────────
 _SERVER        = os.getenv("PREDICT_SERVER_URL", "https://api.agentpredict.work").rstrip("/")
 API_BASE       = _SERVER + "/api"
-COPY_TARGETS   = os.getenv("COPY_TARGETS", "0xb27281c0079b5a1471d424f6Cd6304AB66A4DDB6,0xa9931966708cbc0ee65f38e43474cbdc0de1e243,0xf39bcb5d011d2c722093d8733eeec7146a2c3092").split(",")
+COPY_TARGETS   = [t.strip() for t in os.getenv("COPY_TARGETS", "").split(",") if t.strip()]
+FIREWORKS_KEY  = os.getenv("FIREWORKS_API_KEY", "")
 NVIDIA_KEY     = os.getenv("NVIDIA_API_KEY", "")
 PROXY_HOST     = os.getenv("PROXY_HOST", "")
 PROXY_PORT     = os.getenv("PROXY_PORT", "")
@@ -25,9 +26,9 @@ INACTIVITY_S   = int(os.getenv("INACTIVITY_TIMEOUT", "120"))
 POLL_INTERVAL  = int(os.getenv("POLL_INTERVAL", "30"))
 INDEP_COOLDOWN = int(os.getenv("INDEP_COOLDOWN", "120"))
 
-# Local LLM Support
-LLM_BASE_URL   = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
-LLM_MODEL      = os.getenv("LLM_MODEL", "meta/llama-3.3-70b-instruct")
+# LLM Config
+LLM_BASE_URL   = os.getenv("LLM_BASE_URL", "https://api.fireworks.ai/inference/v1").rstrip("/")
+LLM_MODEL      = os.getenv("LLM_MODEL", "accounts/fireworks/models/llama-v3p3-70b-instruct")
 
 STATE_FILE = f"/app/data/seen_{AGENT_ID}.json"
 os.makedirs("/app/data", exist_ok=True)
@@ -60,6 +61,24 @@ def get_token():
             if t:
                 return t
     return os.getenv("AWP_WALLET_TOKEN", "")
+
+def fetch_leaderboard_targets():
+    """Fetch Top 10 agents from the leaderboard API."""
+    url = f"{API_BASE}/v1/leaderboard"
+    try:
+        log("Refreshing leaderboard targets...")
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        agents = data.get("data", [])
+        top_wallets = [a["agent_address"] for a in agents if "agent_address" in a]
+        targets = top_wallets[:10]
+        if targets:
+            log(f"Dynamic targets loaded: {len(targets)} wallets found. Top 1: {targets[0][:10]}...")
+            return targets
+    except Exception as e:
+        log(f"Error fetching leaderboard: {e}")
+    return []
 
 def api_get(path, params=None):
     headers = {}
@@ -98,18 +117,14 @@ def run_cmd(args, timeout=45):
         return False, "", str(e)
 
 # ── NVIDIA LLM call ───────────────────────────────────────────────────────────
-NVIDIA_MODELS = [
-    "meta/llama-3.3-70b-instruct",
-    "meta/llama-3.1-70b-instruct",
-    "mistralai/mixtral-8x7b-instruct-v0.1",
-]
-
 def llm_call(system_prompt, user_msg, max_tokens=400, temperature=0.4):
-    """Call LLM (NVIDIA or Local) with fallback support."""
+    """Call LLM (Fireworks, NVIDIA, or Local)."""
     headers = {
         "Content-Type":  "application/json",
     }
-    if NVIDIA_KEY:
+    if FIREWORKS_KEY:
+        headers["Authorization"] = f"Bearer {FIREWORKS_KEY}"
+    elif NVIDIA_KEY:
         headers["Authorization"] = f"Bearer {NVIDIA_KEY}"
     
     payload = {
@@ -122,28 +137,21 @@ def llm_call(system_prompt, user_msg, max_tokens=400, temperature=0.4):
         "max_tokens":  max_tokens,
     }
     
-    # List of models to try (if using NVIDIA, try fallbacks; if local, just try the configured one)
-    try_models = [LLM_MODEL]
-    if "nvidia" in LLM_BASE_URL.lower() and not LLM_MODEL.startswith("meta/"):
-        try_models.extend(NVIDIA_MODELS)
-
-    for model in try_models:
-        payload["model"] = model
-        try:
-            r = requests.post(
-                f"{LLM_BASE_URL}/chat/completions",
-                headers=headers,
-                json=payload,
-                proxies=get_proxies(),
-                timeout=60,
-            )
-            r.raise_for_status()
-            raw = r.json().get("choices", [{}])[0].get("message", {}).get("content")
-            if raw:
-                return raw.strip()
-            log(f"LLM {model}: empty content")
-        except Exception as e:
-            log(f"LLM {model} error: {e}")
+    try:
+        r = requests.post(
+            f"{LLM_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+            proxies=get_proxies(),
+            timeout=60,
+        )
+        r.raise_for_status()
+        raw = r.json().get("choices", [{}])[0].get("message", {}).get("content")
+        if raw:
+            return raw.strip()
+        log(f"LLM {LLM_MODEL}: empty content")
+    except Exception as e:
+        log(f"LLM error: {e}")
     return None
 
 # ── Challenge / SMHL ─────────────────────────────────────────────────────────
@@ -530,21 +538,39 @@ def main():
     last_copy_time  = 0.0
     last_indep_time = 0.0
 
-    log(f"Copy trader started | targets={len(COPY_TARGETS)}")
-    for t in COPY_TARGETS:
-        log(f"  Target: {t.strip()}")
+    last_copy_time = time.time()
+    last_indep_time = 0
+    last_refresh = 0
+    
+    global COPY_TARGETS
+    log(f"Dynamic copy trader starting...")
     log(f"Proxy={PROXY_HOST}:{PROXY_PORT} | inactivity={INACTIVITY_S}s | poll={POLL_INTERVAL}s")
     log(f"LLM_BASE={LLM_BASE_URL} | Model={LLM_MODEL}")
 
     while True:
         now = time.time()
 
-        # ── Phase 1: copy trading ─────────────────────────────────────────
+        # ── Refresh leaderboard targets every 60 minutes ──────────────────
+        if now - last_refresh > 3600 or not COPY_TARGETS:
+            new_targets = fetch_leaderboard_targets()
+            if new_targets:
+                COPY_TARGETS = new_targets
+                last_refresh = now
+            elif not COPY_TARGETS:
+                # Emergency fallback if leaderboard is down
+                COPY_TARGETS = ["0x6ad02bbc8d8f01189f27d019e475c5647ef08c2d", "0xf96073b13adc23ac3815a3e778f05f54404b4263"]
+        
+        # ── Phase 1: copy trading (Top 1 & 2 prioritize) ─────────────────
         copied_this_round = 0
-        for target in COPY_TARGETS:
+        for i, target in enumerate(COPY_TARGETS):
             target = target.strip()
             if not target: continue
             
+            # Special log for top 1/2 priority
+            if i < 2:
+                # We check top 2 more aggressively or just log priority
+                pass
+
             predictions = fetch_target_predictions(target)
             for pred in predictions:
                 pid = build_pred_id(pred)
@@ -559,14 +585,15 @@ def main():
                 amount    = pred.get("amount") or pred.get("tickets") or pred.get("chips", 1000)
 
                 if market:
-                    hint = f"Copying target={target} direction={direction} for market {market}"
-                    ok = submit(market, direction, amount, hint)
+                    rank_label = f"Top {i+1}" if i < 10 else "Target"
+                    log(f"[{rank_label}] Copying {target[:10]}... | {market} | {direction}")
+                    ok = submit(market, direction, amount, f"Copying {rank_label} {target}")
                     if ok:
                         last_copy_time = now
                         copied_this_round += 1
 
         if copied_this_round:
-            log(f"Copied {copied_this_round} new prediction(s) from targets")
+            log(f"Copied {copied_this_round} new prediction(s) from alpha leaders")
 
         # ── Phase 2: independent fallback ─────────────────────────────────
         idle_s = now - last_copy_time
